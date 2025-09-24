@@ -643,35 +643,52 @@ def build_ensemble_stem_map(file_paths):
     return stem_map
 
 
-def combine_ensemble_stems(model_stem_maps):
+def combine_ensemble_stems(model_stem_maps, model_names=None):
     if not model_stem_maps:
         raise ValueError("No stems were provided for ensembling")
 
-    base_keys = list(model_stem_maps[0].keys())
-    base_key_set = set(base_keys)
-
-    for stem_map in model_stem_maps[1:]:
-        other_keys = set(stem_map.keys())
-        if other_keys != base_key_set:
-            difference = ", ".join(sorted(base_key_set.symmetric_difference(other_keys)))
-            raise ValueError(f"Incompatible stems across models: {difference}")
+    ordered_keys = []
+    for stem_map in model_stem_maps:
+        for key in stem_map.keys():
+            if key not in ordered_keys:
+                ordered_keys.append(key)
 
     combined_outputs = []
 
-    for stem_key in base_keys:
-        reference_entry = model_stem_maps[0][stem_key]
+    for stem_key in ordered_keys:
+        available_entries = []
+        contributing_models = []
+
+        for index, stem_map in enumerate(model_stem_maps):
+            entry = stem_map.get(stem_key)
+            if entry is None:
+                continue
+
+            available_entries.append(entry)
+            if model_names and index < len(model_names):
+                contributing_models.append(model_names[index])
+            else:
+                contributing_models.append(f"Model {index + 1}")
+
+        if not available_entries:
+            continue
+
+        reference_entry = available_entries[0]
         sample_rate = None
         max_length = 0
         max_channels = 0
         collected_arrays = []
 
-        for stem_map in model_stem_maps:
-            audio_path = stem_map[stem_key]["path"]
+        for entry in available_entries:
+            audio_path = entry["path"]
             audio_array, sr = sf.read(audio_path, always_2d=True)
             if sample_rate is None:
                 sample_rate = sr
             elif sr != sample_rate:
-                raise ValueError("Sample rate mismatch between ensemble models")
+                stem_name = reference_entry["stem_display"]
+                raise ValueError(
+                    f"Sample rate mismatch for stem '{stem_name}': expected {sample_rate}, received {sr}"
+                )
 
             max_length = max(max_length, audio_array.shape[0])
             max_channels = max(max_channels, audio_array.shape[1])
@@ -683,25 +700,33 @@ def combine_ensemble_stems(model_stem_maps):
                 if array.shape[1] == 1 and max_channels == 2:
                     array = np.repeat(array, 2, axis=1)
                 else:
-                    array = np.pad(array, ((0, 0), (0, max_channels - array.shape[1])), mode='constant')
+                    array = np.pad(array, ((0, 0), (0, max_channels - array.shape[1])), mode="constant")
             elif array.shape[1] > max_channels:
                 array = array[:, :max_channels]
 
             if array.shape[0] < max_length:
-                array = np.pad(array, ((0, max_length - array.shape[0]), (0, 0)), mode='constant')
+                array = np.pad(array, ((0, max_length - array.shape[0]), (0, 0)), mode="constant")
 
             aligned_arrays.append(array.astype(np.float64))
 
         stacked = np.stack(aligned_arrays, axis=0)
         averaged = np.mean(stacked, axis=0)
 
-        combined_outputs.append({
-            "stem_token": reference_entry["stem_token"],
-            "stem_display": reference_entry["stem_display"],
-            "audio_base_token": reference_entry["audio_base_token"],
-            "data": averaged.astype(np.float32),
-            "sample_rate": sample_rate,
-        })
+        combined_outputs.append(
+            {
+                "stem_token": reference_entry["stem_token"],
+                "stem_display": reference_entry["stem_display"],
+                "audio_base_token": reference_entry["audio_base_token"],
+                "data": averaged.astype(np.float32),
+                "sample_rate": sample_rate,
+                "model_count": len(available_entries),
+                "source_models": tuple(contributing_models),
+                "stem_key": stem_key,
+            }
+        )
+
+    if not combined_outputs:
+        raise ValueError("No compatible stems were found to combine")
 
     return combined_outputs
 
@@ -1633,7 +1658,27 @@ def ensemble_separator(
 
         status_text = reporter.emit(i18n("Combining stems..."), total_models / total_steps)
         yield (status_text, *empty_audio_updates())
-        combined_outputs = combine_ensemble_stems(stem_maps)
+        combined_outputs = combine_ensemble_stems(stem_maps, model_displays)
+
+        partial_stems = []
+        for entry in combined_outputs:
+            contributing = set(entry.get("source_models", ()))
+            missing_models = [model for model in model_displays if model not in contributing]
+            if missing_models:
+                detail = i18n("{stem} averaged from {count} of {total} models (missing: {models})").format(
+                    stem=entry["stem_display"],
+                    count=entry.get("model_count", 0),
+                    total=len(model_displays),
+                    models=", ".join(missing_models),
+                )
+                partial_stems.append(detail)
+
+        if partial_stems:
+            summary = i18n("Some stems were only produced by a subset of models:\n{details}").format(
+                details="\n".join(f"- {line}" for line in partial_stems)
+            )
+            reporter.emit(summary)
+            gr.Warning(summary)
 
         status_text = reporter.emit(
             i18n("Writing ensemble results..."), (total_models + 1) / total_steps

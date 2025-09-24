@@ -54,6 +54,9 @@ You can also try it on HuggingFace Spaces running with Zero GPU (A100)!
 4. Upload or link an input track and press **Run ensemble**.
 5. Download the generated stems directly from the results area once processing completes.
 
+> [!TIP]
+> When the selected models expose different stem sets, UVR5 UI automatically averages each stem using only the models that produced it and highlights the coverage in the status log.
+
 ## Requirements
 
 ### Hardware Requirements:
