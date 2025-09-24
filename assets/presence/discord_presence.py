@@ -3,6 +3,7 @@ from pypresence.exceptions import DiscordNotFound, InvalidPipe
 import datetime as dt
 import threading
 import functools
+import inspect
 
 class RichPresenceManager:
     def __init__(self):
@@ -140,13 +141,27 @@ def track_presence(state_message):
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            if RPCManager.running and RPCManager.discord_available:
+            should_update = RPCManager.running and RPCManager.discord_available
+            if should_update:
                 RPCManager.set_state(state_message)
+
+            result = func(*args, **kwargs)
+
+            if inspect.isgenerator(result):
+                def generator_wrapper():
+                    try:
+                        for value in result:
+                            yield value
+                    finally:
+                        if RPCManager.running and RPCManager.discord_available:
+                            RPCManager.set_state("Idling")
+
+                return generator_wrapper()
+
             try:
-                result = func(*args, **kwargs)
                 return result
             finally:
-                if RPCManager.running and RPCManager.discord_available:
+                if should_update and RPCManager.running and RPCManager.discord_available:
                     RPCManager.set_state("Idling")
         return wrapper
     return decorator
