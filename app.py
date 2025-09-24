@@ -754,6 +754,7 @@ def run_model_for_ensemble(audio_path, model_info, single_stem, normalization_th
                            roformer_params, mdx23c_params, mdxnet_params, vrarch_params, demucs_params):
     os.makedirs(out_dir, exist_ok=True)
     temp_dir = tempfile.mkdtemp(prefix="ensemble_tmp_", dir=out_dir)
+    success = False
 
     try:
         separator_kwargs = {
@@ -813,19 +814,44 @@ def run_model_for_ensemble(audio_path, model_info, single_stem, normalization_th
         if not os.path.exists(model_path):
             gr.Info(i18n("This is the first time the {model} model is being used. The separation will take a little longer because the model needs to be downloaded.").format(model=model_info["display"]))
 
-        separator.load_model(model_filename=model_filename)
-        separation = separator.separate(audio_path)
+        try:
+            separator.load_model(model_filename=model_filename)
+        except SystemExit as exc:
+            message = i18n(
+                "{model} exited while loading. The model file may be corrupt. Delete {path} and try again."
+            ).format(model=model_info["display"], path=model_path)
+            raise gr.Error(message) from exc
+        except Exception as exc:
+            raise gr.Error(
+                i18n("Failed to load {model}: {error}").format(model=model_info["display"], error=str(exc))
+            ) from exc
+
+        try:
+            separation = separator.separate(audio_path)
+        except SystemExit as exc:
+            message = i18n(
+                "{model} exited unexpectedly during separation. Check the model file and try again."
+            ).format(model=model_info["display"])
+            raise gr.Error(message) from exc
+
         absolute_paths = [os.path.join(temp_dir, file_name) for file_name in separation]
 
         stem_map = build_ensemble_stem_map(absolute_paths)
         if not stem_map:
             raise RuntimeError(i18n("Model {model} did not produce any stems.").format(model=model_info["display"]))
 
+        success = True
         return {"temp_dir": temp_dir, "stems": stem_map}
 
-    except Exception:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+    except gr.Error:
         raise
+    except Exception as exc:
+        raise RuntimeError(
+            i18n("Model {model} failed: {error}").format(model=model_info["display"], error=str(exc))
+        ) from exc
+    finally:
+        if not success:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 components = {
     "Roformer": {}, "MDX23C": {}, "MDX-NET": {}, "VR Arch": {}, "Demucs": {}, "Ensemble": {}
@@ -1573,7 +1599,8 @@ def ensemble_separator(
     except ValueError as e:
         reporter.emit(f"Ensemble error: {e}")
         raise gr.Error(i18n("Ensemble error: {message}").format(message=str(e)))
-    except gr.Error:
+    except gr.Error as e:
+        reporter.emit(f"Ensemble error: {e}")
         raise
     except Exception as e:
         reporter.emit(f"Ensemble separation failed: {e}")
