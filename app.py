@@ -8,10 +8,16 @@ import logging
 import yt_dlp
 import json
 import copy
+import tempfile
+import shutil
+import numpy as np
+import soundfile as sf
+from pydub import AudioSegment
 import gradio as gr
 import urllib.parse
 import assets.themes.loadThemes as loadThemes
 from audio_separator.separator import Separator
+from audio_separator.separator.uvr_lib_v5 import spec_utils
 from assets.i18n.i18n import I18nAuto
 from argparse import ArgumentParser
 from assets.presence.discord_presence import RPCManager, track_presence
@@ -254,6 +260,36 @@ demucs_models = [
     'hdemucs_mmi.yaml',
 ]
 
+ensemble_model_choices = []
+ensemble_model_map = {}
+
+
+def register_ensemble_model(type_key, type_label, display_name, filename):
+    option_label = f"{type_label} | {display_name}"
+    ensemble_model_choices.append(option_label)
+    ensemble_model_map[option_label] = {
+        "type_key": type_key,
+        "type_label": type_label,
+        "display": display_name,
+        "filename": filename,
+    }
+
+
+for display_name, file_name in roformer_models.items():
+    register_ensemble_model("roformer", "BS/Mel Roformer", display_name, file_name)
+
+for file_name in mdx23c_models:
+    register_ensemble_model("mdx23c", "MDX23C", file_name, file_name)
+
+for file_name in mdxnet_models:
+    register_ensemble_model("mdxnet", "MDX-NET", file_name, file_name)
+
+for file_name in vrarch_models:
+    register_ensemble_model("vrarch", "VR Arch", file_name, file_name)
+
+for file_name in demucs_models:
+    register_ensemble_model("demucs", "Demucs", file_name, file_name)
+
 output_format = [
     'wav',
     'flac',
@@ -267,6 +303,33 @@ output_format = [
 
 found_files = []
 logs = []
+
+
+class StatusReporter:
+    """Helper to mirror progress updates to both the UI and terminal."""
+
+    def __init__(self, progress_callback=None):
+        self.progress_callback = progress_callback
+        self.messages = []
+
+    def emit(self, message, progress_value=None):
+        if message:
+            print(message, flush=True)
+            self.messages.append(message)
+
+        if self.progress_callback is not None and progress_value is not None:
+            self.progress_callback(progress_value, desc=message)
+
+        return "\n".join(self.messages)
+
+
+def extract_error_message(error):
+    """Return a user-facing error string without the quotes added by ``gr.Error``."""
+
+    if isinstance(error, gr.Error) and error.args:
+        return str(error.args[0])
+
+    return str(error)
 out_dir = "./outputs"
 models_dir = "./models"
 extensions = (".wav", ".flac", ".mp3", ".ogg", ".opus", ".m4a", ".aiff", ".ac3")
@@ -377,12 +440,16 @@ def alternative_model_downloader(method, key, output_dir="models", progress=gr.P
     total_files = len(model_data[key])
     progress(0, desc="Starting downloads...")
 
+    def record(message):
+        print(message, flush=True)
+        logs.append(message)
+
     for i, url in enumerate(model_data[key]):
         filename = os.path.basename(urllib.parse.urlparse(url).path)
         full_name = os.path.join(output_dir, filename)
 
         if os.path.exists(full_name):
-            logs.append(f"{filename} already exists.")
+            record(f"{filename} already exists.")
             continue
 
         progress((i + 0.1) / total_files, desc=f"Starting download of {filename} ({i+1}/{total_files})")
@@ -422,14 +489,14 @@ def alternative_model_downloader(method, key, output_dir="models", progress=gr.P
             
             process.wait()
             if process.returncode != 0:
-                logs.append(f"Error downloading {filename}")
+                record(f"Error downloading {filename}")
             else:
-                logs.append(f"{filename} downloaded successfully!")
+                record(f"{filename} downloaded successfully!")
                 progress((i + 1) / total_files, desc=f"File {i+1}/{total_files} completed")
-        
+
         except Exception as e:
-            logs.append(f"Error running download command: {str(e)}")
-    
+            record(f"Error running download command: {str(e)}")
+
     progress(1.0, desc="Download process completed")
     return "\n".join(logs)
 
@@ -545,18 +612,343 @@ def reset_settings_to_default():
         gr.Warning(i18n("Error resetting settings"))
         return [gr.update() for _ in all_comps_flat]
 
+ensemble_stem_pattern = re.compile(r"^(?P<audio>.+?)_\((?P<stem>.+?)\)_(?P<model>.+)$")
+
+
+def build_ensemble_stem_map(file_paths):
+    stem_map = {}
+    for index, file_path in enumerate(file_paths, start=1):
+        filename = os.path.basename(file_path)
+        stem_name, _ = os.path.splitext(filename)
+        match = ensemble_stem_pattern.match(stem_name)
+        if match:
+            audio_base = match.group("audio").strip()
+            stem_token = match.group("stem").strip()
+        else:
+            audio_base = stem_name.strip()
+            stem_token = stem_name.strip()
+
+        normalized_key = stem_token.lower()
+        if normalized_key in stem_map:
+            raise ValueError(f"Duplicate stem detected: {stem_token}")
+
+        display_name = stem_token.replace("_", " ").strip() or f"Stem {index}"
+        stem_map[normalized_key] = {
+            "path": file_path,
+            "stem_token": stem_token or display_name,
+            "stem_display": display_name,
+            "audio_base_token": audio_base or stem_name,
+        }
+
+    return stem_map
+
+
+def combine_ensemble_stems(model_stem_maps, model_names=None):
+    if not model_stem_maps:
+        raise ValueError("No stems were provided for ensembling")
+
+    ordered_keys = []
+    for stem_map in model_stem_maps:
+        for key in stem_map.keys():
+            if key not in ordered_keys:
+                ordered_keys.append(key)
+
+    combined_outputs = []
+
+    for stem_key in ordered_keys:
+        available_entries = []
+        contributing_models = []
+
+        for index, stem_map in enumerate(model_stem_maps):
+            entry = stem_map.get(stem_key)
+            if entry is None:
+                continue
+
+            available_entries.append(entry)
+            if model_names and index < len(model_names):
+                contributing_models.append(model_names[index])
+            else:
+                contributing_models.append(f"Model {index + 1}")
+
+        if not available_entries:
+            continue
+
+        reference_entry = available_entries[0]
+        sample_rate = None
+        max_length = 0
+        max_channels = 0
+        collected_arrays = []
+
+        for entry in available_entries:
+            audio_path = entry["path"]
+            audio_array, sr = sf.read(audio_path, always_2d=True)
+            if sample_rate is None:
+                sample_rate = sr
+            elif sr != sample_rate:
+                stem_name = reference_entry["stem_display"]
+                raise ValueError(
+                    f"Sample rate mismatch for stem '{stem_name}': expected {sample_rate}, received {sr}"
+                )
+
+            max_length = max(max_length, audio_array.shape[0])
+            max_channels = max(max_channels, audio_array.shape[1])
+            collected_arrays.append(audio_array)
+
+        aligned_arrays = []
+        for array in collected_arrays:
+            if array.shape[1] < max_channels:
+                if array.shape[1] == 1 and max_channels == 2:
+                    array = np.repeat(array, 2, axis=1)
+                else:
+                    array = np.pad(array, ((0, 0), (0, max_channels - array.shape[1])), mode="constant")
+            elif array.shape[1] > max_channels:
+                array = array[:, :max_channels]
+
+            if array.shape[0] < max_length:
+                array = np.pad(array, ((0, max_length - array.shape[0]), (0, 0)), mode="constant")
+
+            aligned_arrays.append(array.astype(np.float64))
+
+        stacked = np.stack(aligned_arrays, axis=0)
+        averaged = np.mean(stacked, axis=0)
+
+        combined_outputs.append(
+            {
+                "stem_token": reference_entry["stem_token"],
+                "stem_display": reference_entry["stem_display"],
+                "audio_base_token": reference_entry["audio_base_token"],
+                "data": averaged.astype(np.float32),
+                "sample_rate": sample_rate,
+                "model_count": len(available_entries),
+                "source_models": tuple(contributing_models),
+                "stem_key": stem_key,
+            }
+        )
+
+    if not combined_outputs:
+        raise ValueError("No compatible stems were found to combine")
+
+    return combined_outputs
+
+
+def write_ensemble_outputs(combined_outputs, output_format, normalization_threshold, amplification_threshold):
+    ensemble_results = []
+    os.makedirs(out_dir, exist_ok=True)
+    export_format = (output_format or "wav").lower()
+
+    for entry in combined_outputs:
+        file_name = f"{entry['audio_base_token']}_({entry['stem_token']})_Ensemble.{export_format}"
+        destination = os.path.join(out_dir, file_name)
+
+        audio_data = entry["data"]
+        if audio_data.ndim == 1:
+            audio_data = audio_data[:, np.newaxis]
+
+        peak = np.max(np.abs(audio_data)) if audio_data.size else 0.0
+        if peak >= 1e-9:
+            normalized = spec_utils.normalize(audio_data.copy(), max_peak=normalization_threshold, min_peak=amplification_threshold)
+        else:
+            normalized = np.zeros_like(audio_data)
+
+        normalized = np.clip(normalized, -1.0, 1.0)
+        int_data = (normalized * 32767).astype(np.int16)
+
+        if int_data.ndim == 1:
+            int_data = int_data[:, np.newaxis]
+
+        channels = int_data.shape[1]
+        if channels > 1:
+            interleaved = np.empty((channels * int_data.shape[0],), dtype=np.int16)
+            for channel_index in range(channels):
+                interleaved[channel_index::channels] = int_data[:, channel_index]
+        else:
+            interleaved = int_data[:, 0]
+
+        audio_segment = AudioSegment(
+            interleaved.tobytes(),
+            frame_rate=entry["sample_rate"],
+            sample_width=int_data.dtype.itemsize,
+            channels=channels,
+        )
+
+        export_format_name = export_format
+        if export_format_name == "m4a":
+            export_format_name = "mp4"
+        elif export_format_name == "mka":
+            export_format_name = "matroska"
+
+        bitrate = "320k" if export_format == "mp3" else None
+        audio_segment.export(destination, format=export_format_name, bitrate=bitrate)
+        ensemble_results.append((entry["stem_display"], destination))
+
+    return ensemble_results
+
+
+def run_model_for_ensemble(
+    audio_path,
+    model_info,
+    single_stem,
+    normalization_threshold,
+    amplification_threshold,
+    roformer_params,
+    mdx23c_params,
+    mdxnet_params,
+    vrarch_params,
+    demucs_params,
+    reporter,
+    progress_start=None,
+    progress_end=None,
+):
+    os.makedirs(out_dir, exist_ok=True)
+    temp_dir = tempfile.mkdtemp(prefix="ensemble_tmp_", dir=out_dir)
+    success = False
+
+    def scaled_progress(fraction):
+        if progress_start is None or progress_end is None:
+            return None
+        return progress_start + (progress_end - progress_start) * fraction
+
+    model_display = model_info["display"]
+
+    try:
+        separator_kwargs = {
+            "log_level": logging.WARNING,
+            "model_file_dir": models_dir,
+            "output_dir": temp_dir,
+            "output_format": "wav",
+            "use_autocast": use_autocast,
+            "normalization_threshold": normalization_threshold,
+            "amplification_threshold": amplification_threshold,
+            "output_single_stem": single_stem,
+        }
+
+        model_type = model_info["type_key"]
+
+        if model_type in {"roformer", "mdx23c"}:
+            params = roformer_params if model_type == "roformer" else mdx23c_params
+            separator_kwargs["mdxc_params"] = {
+                "segment_size": params["segment_size"],
+                "override_model_segment_size": params["override_segment_size"],
+                "batch_size": params["batch_size"],
+                "overlap": params["overlap"],
+            }
+        elif model_type == "mdxnet":
+            separator_kwargs["mdx_params"] = {
+                "hop_length": mdxnet_params["hop_length"],
+                "segment_size": mdxnet_params["segment_size"],
+                "overlap": mdxnet_params["overlap"],
+                "batch_size": mdxnet_params["batch_size"],
+                "enable_denoise": mdxnet_params["denoise"],
+            }
+        elif model_type == "vrarch":
+            separator_kwargs["vr_params"] = {
+                "batch_size": vrarch_params["batch_size"],
+                "window_size": vrarch_params["window_size"],
+                "aggression": vrarch_params["aggression"],
+                "enable_tta": vrarch_params["tta"],
+                "enable_post_process": vrarch_params["post_process"],
+                "post_process_threshold": vrarch_params["post_process_threshold"],
+                "high_end_process": vrarch_params["high_end_process"],
+            }
+        elif model_type == "demucs":
+            separator_kwargs["demucs_params"] = {
+                "batch_size": demucs_params["batch_size"],
+                "segment_size": demucs_params["segment_size"],
+                "shifts": demucs_params["shifts"],
+                "overlap": demucs_params["overlap"],
+                "segments_enabled": demucs_params["segments_enabled"],
+            }
+        else:
+            raise ValueError(f"Unsupported ensemble model type: {model_type}")
+
+        separator = Separator(**separator_kwargs)
+        model_filename = model_info["filename"]
+        model_path = os.path.join(models_dir, model_filename)
+
+        if not os.path.exists(model_path):
+            download_message = i18n("Downloading model: {model}...").format(model=model_display)
+            yield reporter.emit(download_message, scaled_progress(0.0))
+            gr.Info(
+                i18n(
+                    "This is the first time the {model} model is being used. The separation will take a little longer because the model needs to be downloaded."
+                ).format(model=model_display)
+            )
+
+        yield reporter.emit(i18n("Loading {model}...").format(model=model_display), scaled_progress(0.1))
+        try:
+            separator.load_model(model_filename=model_filename)
+        except SystemExit as exc:
+            message = i18n(
+                "{model} exited while loading. The model file may be corrupt. Delete {path} and try again."
+            ).format(model=model_display, path=model_path)
+            yield reporter.emit(message, scaled_progress(0.15))
+            raise gr.Error(message) from exc
+        except Exception as exc:
+            message = i18n("Failed to load {model}: {error}").format(model=model_display, error=str(exc))
+            yield reporter.emit(message, scaled_progress(0.15))
+            raise gr.Error(message) from exc
+
+        yield reporter.emit(
+            i18n("Separating with {model}...").format(model=model_display), scaled_progress(0.6)
+        )
+        try:
+            separation = separator.separate(audio_path)
+        except SystemExit as exc:
+            message = i18n(
+                "{model} exited unexpectedly during separation. Check the model file and try again."
+            ).format(model=model_display)
+            yield reporter.emit(message, scaled_progress(0.6))
+            raise gr.Error(message) from exc
+
+        absolute_paths = [os.path.join(temp_dir, file_name) for file_name in separation]
+
+        yield reporter.emit(
+            i18n("Collecting stems from {model}...").format(model=model_display), scaled_progress(0.85)
+        )
+        stem_map = build_ensemble_stem_map(absolute_paths)
+        if not stem_map:
+            message = i18n("Model {model} did not produce any stems.").format(model=model_display)
+            yield reporter.emit(message, scaled_progress(0.9))
+            raise RuntimeError(message)
+
+        success = True
+        completion_message = i18n("{model} separation complete.").format(model=model_display)
+        yield reporter.emit(completion_message, scaled_progress(1.0))
+        return {"temp_dir": temp_dir, "stems": stem_map}
+
+    except gr.Error:
+        raise
+    except Exception as exc:
+        message = i18n("Model {model} failed: {error}").format(model=model_display, error=str(exc))
+        yield reporter.emit(message, scaled_progress(1.0))
+        raise RuntimeError(message) from exc
+    finally:
+        if not success:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
 components = {
-    "Roformer": {}, "MDX23C": {}, "MDX-NET": {}, "VR Arch": {}, "Demucs": {}
+    "Roformer": {}, "MDX23C": {}, "MDX-NET": {}, "VR Arch": {}, "Demucs": {}, "Ensemble": {}
 }
 
 @track_presence("Performing BS/Mel Roformer Separation")
 def roformer_separator(audio, model_key, out_format, segment_size, override_seg_size, overlap, batch_size, norm_thresh, amp_thresh, single_stem, progress=gr.Progress(track_tqdm=True)):
     roformer_model = roformer_models[model_key]
     model_path = os.path.join(models_dir, roformer_model)
+    reporter = StatusReporter(progress)
+
+    def empty_audio_updates():
+        return (gr.update(value=None), gr.update(value=None))
+
     try:
+        status_text = reporter.emit(i18n("Preparing separation..."), 0.0)
+        yield (status_text, *empty_audio_updates())
+
         if not os.path.exists(model_path):
-            gr.Info(f"This is the first time the {model_key} model is being used. The separation will take a little longer because the model needs to be downloaded.")
-        
+            download_message = i18n("Downloading model: {model}...").format(model=model_key)
+            status_text = reporter.emit(download_message)
+            yield (status_text, *empty_audio_updates())
+            gr.Info(i18n("This is the first time the {model} model is being used. The separation will take a little longer because the model needs to be downloaded.").format(model=model_key))
+
         separator = Separator(
             log_level=logging.WARNING,
             model_file_dir=models_dir,
@@ -573,29 +965,47 @@ def roformer_separator(audio, model_key, out_format, segment_size, override_seg_
                 "overlap": overlap,
             }
         )
-    
-        progress(0.2, desc="Loading model...")
+
+        status_text = reporter.emit(i18n("Loading model..."), 0.2)
+        yield (status_text, *empty_audio_updates())
         separator.load_model(model_filename=roformer_model)
 
-        progress(0.7, desc="Separating audio...")
+        status_text = reporter.emit(i18n("Separating audio..."), 0.7)
+        yield (status_text, *empty_audio_updates())
         separation = separator.separate(audio)
 
         stems = [os.path.join(out_dir, file_name) for file_name in separation]
 
+        status_text = reporter.emit(i18n("Finalizing outputs..."), 0.9)
+        yield (status_text, *empty_audio_updates())
+
+        final_status = reporter.emit(i18n("Separation complete."), 1.0)
         if single_stem.strip():
-            return stems[0], None
-        
-        return stems[0], stems[1]
-    
+            yield final_status, stems[0], None
+        else:
+            yield final_status, stems[0], stems[1]
+
     except Exception as e:
+        reporter.emit(f"Roformer separation failed: {e}")
         raise RuntimeError(f"Roformer separation failed: {e}") from e
 
 @track_presence("Performing MDXC Separationn")
 def mdxc_separator(audio, model, out_format, segment_size, override_seg_size, overlap, batch_size, norm_thresh, amp_thresh, single_stem, progress=gr.Progress(track_tqdm=True)):
     model_path = os.path.join(models_dir, model)
+    reporter = StatusReporter(progress)
+
+    def empty_audio_updates():
+        return (gr.update(value=None), gr.update(value=None))
+
     try:
+        status_text = reporter.emit(i18n("Preparing separation..."), 0.0)
+        yield (status_text, *empty_audio_updates())
+
         if not os.path.exists(model_path):
-            gr.Info(f"This is the first time the {model} model is being used. The separation will take a little longer because the model needs to be downloaded.")
+            download_message = i18n("Downloading model: {model}...").format(model=model)
+            status_text = reporter.emit(download_message)
+            yield (status_text, *empty_audio_updates())
+            gr.Info(i18n("This is the first time the {model} model is being used. The separation will take a little longer because the model needs to be downloaded.").format(model=model))
 
         separator = Separator(
             log_level=logging.WARNING,
@@ -614,28 +1024,46 @@ def mdxc_separator(audio, model, out_format, segment_size, override_seg_size, ov
             }
         )
 
-        progress(0.2, desc="Loading model...")
+        status_text = reporter.emit(i18n("Loading model..."), 0.2)
+        yield (status_text, *empty_audio_updates())
         separator.load_model(model_filename=model)
 
-        progress(0.7, desc="Separating audio...")
+        status_text = reporter.emit(i18n("Separating audio..."), 0.7)
+        yield (status_text, *empty_audio_updates())
         separation = separator.separate(audio)
 
         stems = [os.path.join(out_dir, file_name) for file_name in separation]
-        
+
+        status_text = reporter.emit(i18n("Finalizing outputs..."), 0.9)
+        yield (status_text, *empty_audio_updates())
+
+        final_status = reporter.emit(i18n("Separation complete."), 1.0)
         if single_stem.strip():
-            return stems[0], None
-        
-        return stems[0], stems[1]
+            yield final_status, stems[0], None
+        else:
+            yield final_status, stems[0], stems[1]
 
     except Exception as e:
+        reporter.emit(f"MDX23C separation failed: {e}")
         raise RuntimeError(f"MDX23C separation failed: {e}") from e
 
 @track_presence("Performing MDX-NET Separation")
 def mdxnet_separator(audio, model, out_format, hop_length, segment_size, denoise, overlap, batch_size, norm_thresh, amp_thresh, single_stem, progress=gr.Progress(track_tqdm=True)):
     model_path = os.path.join(models_dir, model)
+    reporter = StatusReporter(progress)
+
+    def empty_audio_updates():
+        return (gr.update(value=None), gr.update(value=None))
+
     try:
+        status_text = reporter.emit(i18n("Preparing separation..."), 0.0)
+        yield (status_text, *empty_audio_updates())
+
         if not os.path.exists(model_path):
-            gr.Info(f"This is the first time the {model} model is being used. The separation will take a little longer because the model needs to be downloaded.")
+            download_message = i18n("Downloading model: {model}...").format(model=model)
+            status_text = reporter.emit(download_message)
+            yield (status_text, *empty_audio_updates())
+            gr.Info(i18n("This is the first time the {model} model is being used. The separation will take a little longer because the model needs to be downloaded.").format(model=model))
 
         separator = Separator(
             log_level=logging.WARNING,
@@ -655,28 +1083,46 @@ def mdxnet_separator(audio, model, out_format, hop_length, segment_size, denoise
             }
         )
 
-        progress(0.2, desc="Loading model...")
+        status_text = reporter.emit(i18n("Loading model..."), 0.2)
+        yield (status_text, *empty_audio_updates())
         separator.load_model(model_filename=model)
 
-        progress(0.7, desc="Separating audio...")
+        status_text = reporter.emit(i18n("Separating audio..."), 0.7)
+        yield (status_text, *empty_audio_updates())
         separation = separator.separate(audio)
 
         stems = [os.path.join(out_dir, file_name) for file_name in separation]
-        
+
+        status_text = reporter.emit(i18n("Finalizing outputs..."), 0.9)
+        yield (status_text, *empty_audio_updates())
+
+        final_status = reporter.emit(i18n("Separation complete."), 1.0)
         if single_stem.strip():
-            return stems[0], None
-        
-        return stems[0], stems[1]
+            yield final_status, stems[0], None
+        else:
+            yield final_status, stems[0], stems[1]
 
     except Exception as e:
+        reporter.emit(f"MDX-NET separation failed: {e}")
         raise RuntimeError(f"MDX-NET separation failed: {e}") from e
 
 @track_presence("Performing VR Arch Separation")
 def vrarch_separator(audio, model, out_format, window_size, aggression, tta, post_process, post_process_threshold, high_end_process, batch_size, norm_thresh, amp_thresh, single_stem, progress=gr.Progress(track_tqdm=True)):
     model_path = os.path.join(models_dir, model)
+    reporter = StatusReporter(progress)
+
+    def empty_audio_updates():
+        return (gr.update(value=None), gr.update(value=None))
+
     try:
+        status_text = reporter.emit(i18n("Preparing separation..."), 0.0)
+        yield (status_text, *empty_audio_updates())
+
         if not os.path.exists(model_path):
-            gr.Info(f"This is the first time the {model} model is being used. The separation will take a little longer because the model needs to be downloaded.")
+            download_message = i18n("Downloading model: {model}...").format(model=model)
+            status_text = reporter.emit(download_message)
+            yield (status_text, *empty_audio_updates())
+            gr.Info(i18n("This is the first time the {model} model is being used. The separation will take a little longer because the model needs to be downloaded.").format(model=model))
 
         separator = Separator(
             log_level=logging.WARNING,
@@ -698,28 +1144,46 @@ def vrarch_separator(audio, model, out_format, window_size, aggression, tta, pos
             }
         )
 
-        progress(0.2, desc="Loading model...")
+        status_text = reporter.emit(i18n("Loading model..."), 0.2)
+        yield (status_text, *empty_audio_updates())
         separator.load_model(model_filename=model)
 
-        progress(0.7, desc="Separating audio...")
+        status_text = reporter.emit(i18n("Separating audio..."), 0.7)
+        yield (status_text, *empty_audio_updates())
         separation = separator.separate(audio)
 
         stems = [os.path.join(out_dir, file_name) for file_name in separation]
-        
+
+        status_text = reporter.emit(i18n("Finalizing outputs..."), 0.9)
+        yield (status_text, *empty_audio_updates())
+
+        final_status = reporter.emit(i18n("Separation complete."), 1.0)
         if single_stem.strip():
-            return stems[0], None
-        
-        return stems[0], stems[1]
+            yield final_status, stems[0], None
+        else:
+            yield final_status, stems[0], stems[1]
 
     except Exception as e:
+        reporter.emit(f"VR ARCH separation failed: {e}")
         raise RuntimeError(f"VR ARCH separation failed: {e}") from e
 
 @track_presence("Performing Demucs Separation")
 def demucs_separator(audio, model, out_format, shifts, segment_size, segments_enabled, overlap, batch_size, norm_thresh, amp_thresh, progress=gr.Progress(track_tqdm=True)):
     model_path = os.path.join(models_dir, model)
+    reporter = StatusReporter(progress)
+
+    def empty_audio_updates():
+        return tuple(gr.update(value=None) for _ in range(6))
+
     try:
+        status_text = reporter.emit(i18n("Preparing separation..."), 0.0)
+        yield (status_text, *empty_audio_updates())
+
         if not os.path.exists(model_path):
-            gr.Info(f"This is the first time the {model} model is being used. The separation will take a little longer because the model needs to be downloaded.")
+            download_message = i18n("Downloading model: {model}...").format(model=model)
+            status_text = reporter.emit(download_message)
+            yield (status_text, *empty_audio_updates())
+            gr.Info(i18n("This is the first time the {model} model is being used. The separation will take a little longer because the model needs to be downloaded.").format(model=model))
 
         separator = Separator(
             log_level=logging.WARNING,
@@ -738,20 +1202,27 @@ def demucs_separator(audio, model, out_format, shifts, segment_size, segments_en
             }
         )
 
-        progress(0.2, desc="Loading model...")
+        status_text = reporter.emit(i18n("Loading model..."), 0.2)
+        yield (status_text, *empty_audio_updates())
         separator.load_model(model_filename=model)
 
-        progress(0.7, desc="Separating audio...")
+        status_text = reporter.emit(i18n("Separating audio..."), 0.7)
+        yield (status_text, *empty_audio_updates())
         separation = separator.separate(audio)
 
         stems = [os.path.join(out_dir, file_name) for file_name in separation]
-        
+
+        status_text = reporter.emit(i18n("Finalizing outputs..."), 0.9)
+        yield (status_text, *empty_audio_updates())
+
+        final_status = reporter.emit(i18n("Separation complete."), 1.0)
         if model == "htdemucs_6s.yaml":
-            return stems[0], stems[1], stems[2], stems[3], stems[4], stems[5]
+            yield (final_status, *stems[:6])
         else:
-            return stems[0], stems[1], stems[2], stems[3], None, None
+            yield final_status, stems[0], stems[1], stems[2], stems[3], None, None
 
     except Exception as e:
+        reporter.emit(f"Demucs separation failed: {e}")
         raise RuntimeError(f"Demucs separation failed: {e}") from e
 
 def update_stems(model):
@@ -1039,7 +1510,217 @@ def demucs_batch(path_input, path_output, model, out_format, shifts, segment_siz
             
         progress(1.0, desc="Processing complete")
         return "\n".join(logs)
-            
+
+
+@track_presence("Performing Ensemble Separation")
+def ensemble_separator(
+    audio,
+    selected_models,
+    out_format,
+    single_stem,
+    normalization_threshold,
+    amplification_threshold,
+    roformer_segment_size,
+    roformer_override_segment_size,
+    roformer_overlap,
+    roformer_batch_size,
+    mdx23c_segment_size,
+    mdx23c_override_segment_size,
+    mdx23c_overlap,
+    mdx23c_batch_size,
+    mdxnet_hop_length,
+    mdxnet_segment_size,
+    mdxnet_denoise,
+    mdxnet_overlap,
+    mdxnet_batch_size,
+    vrarch_window_size,
+    vrarch_aggression,
+    vrarch_tta,
+    vrarch_post_process,
+    vrarch_post_process_threshold,
+    vrarch_high_end_process,
+    vrarch_batch_size,
+    demucs_shifts,
+    demucs_segment_size,
+    demucs_segments_enabled,
+    demucs_overlap,
+    demucs_batch_size,
+    progress=gr.Progress(track_tqdm=True),
+):
+    temp_dirs = []
+    reporter = StatusReporter(progress)
+
+    def empty_audio_updates():
+        return [gr.update(value=None, visible=False) for _ in range(6)]
+
+    try:
+        if not audio:
+            raise gr.Error(i18n("Please provide an input audio file."))
+
+        if not selected_models or len(selected_models) < 2:
+            raise gr.Error(i18n("Select at least two models to perform an ensemble."))
+
+        audio_path = audio
+        if not os.path.exists(audio_path):
+            raise gr.Error(i18n("The selected audio file could not be found."))
+
+        output_format = (out_format or "wav").lower()
+        single_stem_value = single_stem.strip()
+
+        roformer_params = {
+            "segment_size": int(roformer_segment_size),
+            "override_segment_size": bool(roformer_override_segment_size),
+            "overlap": int(roformer_overlap),
+            "batch_size": int(roformer_batch_size),
+        }
+        mdx23c_params = {
+            "segment_size": int(mdx23c_segment_size),
+            "override_segment_size": bool(mdx23c_override_segment_size),
+            "overlap": int(mdx23c_overlap),
+            "batch_size": int(mdx23c_batch_size),
+        }
+        mdxnet_params = {
+            "hop_length": int(mdxnet_hop_length),
+            "segment_size": int(mdxnet_segment_size),
+            "denoise": bool(mdxnet_denoise),
+            "overlap": float(mdxnet_overlap),
+            "batch_size": int(mdxnet_batch_size),
+        }
+        vrarch_params = {
+            "window_size": int(vrarch_window_size),
+            "aggression": int(vrarch_aggression),
+            "tta": bool(vrarch_tta),
+            "post_process": bool(vrarch_post_process),
+            "post_process_threshold": float(vrarch_post_process_threshold),
+            "high_end_process": bool(vrarch_high_end_process),
+            "batch_size": int(vrarch_batch_size),
+        }
+        demucs_params = {
+            "shifts": int(demucs_shifts),
+            "segment_size": int(demucs_segment_size),
+            "segments_enabled": bool(demucs_segments_enabled),
+            "overlap": float(demucs_overlap),
+            "batch_size": int(demucs_batch_size),
+        }
+
+        total_models = len(selected_models)
+        total_steps = total_models + 2
+        status_text = reporter.emit(i18n("Preparing ensemble..."), 0.0)
+        yield (status_text, *empty_audio_updates())
+
+        stem_maps = []
+        model_displays = []
+
+        for index, model_option in enumerate(selected_models):
+            model_info = ensemble_model_map.get(model_option)
+            if not model_info:
+                raise gr.Error(i18n("Unknown model selected: {model}").format(model=model_option))
+
+            model_displays.append(model_info["display"])
+            model_start_progress = index / total_steps
+            model_end_progress = (index + 1) / total_steps
+            status_text = reporter.emit(
+                i18n("Separating with {model}...").format(model=model_option),
+                model_start_progress,
+            )
+            yield (status_text, *empty_audio_updates())
+            runner = run_model_for_ensemble(
+                audio_path,
+                model_info,
+                single_stem_value,
+                normalization_threshold,
+                amplification_threshold,
+                roformer_params,
+                mdx23c_params,
+                mdxnet_params,
+                vrarch_params,
+                demucs_params,
+                reporter,
+                model_start_progress,
+                model_end_progress,
+            )
+
+            result = None
+            while True:
+                try:
+                    status_text = next(runner)
+                except StopIteration as stop:
+                    result = stop.value
+                    break
+                else:
+                    yield (status_text, *empty_audio_updates())
+
+            if result is None:
+                raise RuntimeError(i18n("{model} finished without producing results.").format(model=model_option))
+
+            temp_dirs.append(result["temp_dir"])
+            stem_maps.append(result["stems"])
+
+        status_text = reporter.emit(i18n("Combining stems..."), total_models / total_steps)
+        yield (status_text, *empty_audio_updates())
+        combined_outputs = combine_ensemble_stems(stem_maps, model_displays)
+
+        partial_stems = []
+        for entry in combined_outputs:
+            contributing = set(entry.get("source_models", ()))
+            missing_models = [model for model in model_displays if model not in contributing]
+            if missing_models:
+                detail = i18n("{stem} averaged from {count} of {total} models (missing: {models})").format(
+                    stem=entry["stem_display"],
+                    count=entry.get("model_count", 0),
+                    total=len(model_displays),
+                    models=", ".join(missing_models),
+                )
+                partial_stems.append(detail)
+
+        if partial_stems:
+            summary = i18n("Some stems were only produced by a subset of models:\n{details}").format(
+                details="\n".join(f"- {line}" for line in partial_stems)
+            )
+            reporter.emit(summary)
+            gr.Warning(summary)
+
+        status_text = reporter.emit(
+            i18n("Writing ensemble results..."), (total_models + 1) / total_steps
+        )
+        yield (status_text, *empty_audio_updates())
+        ensemble_files = write_ensemble_outputs(
+            combined_outputs,
+            output_format,
+            normalization_threshold,
+            amplification_threshold,
+        )
+
+        final_status = reporter.emit(i18n("Ensemble complete"), 1.0)
+
+        if ensemble_files:
+            gr.Info(i18n("Ensemble completed using: {models}").format(models=", ".join(model_displays)))
+
+        ensemble_label = i18n("Ensemble")
+        updates = []
+        for stem_name, file_path in ensemble_files:
+            updates.append(gr.update(value=file_path, label=f"{stem_name} ({ensemble_label})", visible=True))
+
+        for _ in range(len(ensemble_files), 6):
+            updates.append(gr.update(value=None, visible=False))
+
+        yield (final_status, *updates)
+
+    except gr.Error as e:
+        message = extract_error_message(e)
+        reporter.emit(i18n("Ensemble error: {message}").format(message=message))
+        raise
+    except ValueError as e:
+        message = str(e)
+        reporter.emit(i18n("Ensemble error: {message}").format(message=message))
+        raise gr.Error(i18n("Ensemble error: {message}").format(message=message))
+    except Exception as e:
+        reporter.emit(f"Ensemble separation failed: {e}")
+        raise RuntimeError(f"Ensemble separation failed: {e}") from e
+    finally:
+        for temp_dir in temp_dirs:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
 with gr.Blocks(theme = loadThemes.load_json() or "NoCrypt/miku", title = "🎵 UVR5 UI 🎵") as app:
     gr.Markdown("<h1> 🎵 UVR5 UI 🎵 </h1>")
     gr.Markdown(i18n("If you like UVR5 UI you can star my repo on [GitHub](https://github.com/Eddycrack864/UVR5-UI)"))
@@ -1190,6 +1871,13 @@ with gr.Blocks(theme = loadThemes.load_json() or "NoCrypt/miku", title = "🎵 U
             with gr.Row():
                 roformer_button = gr.Button(i18n("Separate!"), variant = "primary")
             with gr.Row():
+                roformer_status = gr.Textbox(
+                    label = i18n("Status log"),
+                    interactive = False,
+                    lines = 6,
+                    value = ""
+                )
+            with gr.Row():
                 roformer_stem1 = gr.Audio(
                     show_download_button = True,
                     interactive = False,
@@ -1203,7 +1891,22 @@ with gr.Blocks(theme = loadThemes.load_json() or "NoCrypt/miku", title = "🎵 U
                     type = "filepath"
                 )
 
-            roformer_button.click(roformer_separator, [roformer_audio, roformer_model, roformer_output_format, roformer_segment_size, roformer_override_segment_size, roformer_overlap, roformer_batch_size, roformer_normalization_threshold, roformer_amplification_threshold, roformer_single_stem], [roformer_stem1, roformer_stem2])
+            roformer_button.click(
+                roformer_separator,
+                [
+                    roformer_audio,
+                    roformer_model,
+                    roformer_output_format,
+                    roformer_segment_size,
+                    roformer_override_segment_size,
+                    roformer_overlap,
+                    roformer_batch_size,
+                    roformer_normalization_threshold,
+                    roformer_amplification_threshold,
+                    roformer_single_stem,
+                ],
+                [roformer_status, roformer_stem1, roformer_stem2],
+            )
 
         with gr.TabItem("MDX23C"):
             with gr.Row():
@@ -1349,6 +2052,13 @@ with gr.Blocks(theme = loadThemes.load_json() or "NoCrypt/miku", title = "🎵 U
             with gr.Row():
                 mdx23c_button = gr.Button(i18n("Separate!"), variant = "primary")
             with gr.Row():
+                mdx23c_status = gr.Textbox(
+                    label = i18n("Status log"),
+                    interactive = False,
+                    lines = 6,
+                    value = ""
+                )
+            with gr.Row():
                 mdx23c_stem1 = gr.Audio(
                     show_download_button = True,
                     interactive = False,
@@ -1362,7 +2072,22 @@ with gr.Blocks(theme = loadThemes.load_json() or "NoCrypt/miku", title = "🎵 U
                     type = "filepath"
                 )
 
-            mdx23c_button.click(mdxc_separator, [mdx23c_audio, mdx23c_model, mdx23c_output_format, mdx23c_segment_size, mdx23c_override_segment_size, mdx23c_overlap, mdx23c_batch_size, mdx23c_normalization_threshold, mdx23c_amplification_threshold, mdx23c_single_stem], [mdx23c_stem1, mdx23c_stem2])
+            mdx23c_button.click(
+                mdxc_separator,
+                [
+                    mdx23c_audio,
+                    mdx23c_model,
+                    mdx23c_output_format,
+                    mdx23c_segment_size,
+                    mdx23c_override_segment_size,
+                    mdx23c_overlap,
+                    mdx23c_batch_size,
+                    mdx23c_normalization_threshold,
+                    mdx23c_amplification_threshold,
+                    mdx23c_single_stem,
+                ],
+                [mdx23c_status, mdx23c_stem1, mdx23c_stem2],
+            )
                 
         with gr.TabItem("MDX-NET"):
             with gr.Row():
@@ -1518,6 +2243,13 @@ with gr.Blocks(theme = loadThemes.load_json() or "NoCrypt/miku", title = "🎵 U
             with gr.Row():
                 mdxnet_button = gr.Button(i18n("Separate!"), variant = "primary")
             with gr.Row():
+                mdxnet_status = gr.Textbox(
+                    label = i18n("Status log"),
+                    interactive = False,
+                    lines = 6,
+                    value = ""
+                )
+            with gr.Row():
                 mdxnet_stem1 = gr.Audio(
                     show_download_button = True,
                     interactive = False,
@@ -1531,7 +2263,23 @@ with gr.Blocks(theme = loadThemes.load_json() or "NoCrypt/miku", title = "🎵 U
                     type = "filepath"
                 )
 
-            mdxnet_button.click(mdxnet_separator, [mdxnet_audio, mdxnet_model, mdxnet_output_format, mdxnet_hop_length, mdxnet_segment_size, mdxnet_denoise, mdxnet_overlap, mdxnet_batch_size, mdxnet_normalization_threshold, mdxnet_amplification_threshold, mdxnet_single_stem], [mdxnet_stem1, mdxnet_stem2])
+            mdxnet_button.click(
+                mdxnet_separator,
+                [
+                    mdxnet_audio,
+                    mdxnet_model,
+                    mdxnet_output_format,
+                    mdxnet_hop_length,
+                    mdxnet_segment_size,
+                    mdxnet_denoise,
+                    mdxnet_overlap,
+                    mdxnet_batch_size,
+                    mdxnet_normalization_threshold,
+                    mdxnet_amplification_threshold,
+                    mdxnet_single_stem,
+                ],
+                [mdxnet_status, mdxnet_stem1, mdxnet_stem2],
+            )
 
         with gr.TabItem("VR ARCH"):
             with gr.Row():
@@ -1705,6 +2453,13 @@ with gr.Blocks(theme = loadThemes.load_json() or "NoCrypt/miku", title = "🎵 U
             with gr.Row():
                 vrarch_button = gr.Button(i18n("Separate!"), variant = "primary")
             with gr.Row():
+                vrarch_status = gr.Textbox(
+                    label = i18n("Status log"),
+                    interactive = False,
+                    lines = 6,
+                    value = ""
+                )
+            with gr.Row():
                 vrarch_stem1 = gr.Audio(
                     show_download_button = True,
                     interactive = False,
@@ -1718,7 +2473,25 @@ with gr.Blocks(theme = loadThemes.load_json() or "NoCrypt/miku", title = "🎵 U
                     label = i18n("Stem 2")
                 )
 
-            vrarch_button.click(vrarch_separator, [vrarch_audio, vrarch_model, vrarch_output_format, vrarch_window_size, vrarch_agression, vrarch_tta, vrarch_post_process, vrarch_post_process_threshold, vrarch_high_end_process, vrarch_batch_size, vrarch_normalization_threshold, vrarch_amplification_threshold, vrarch_single_stem], [vrarch_stem1, vrarch_stem2])
+            vrarch_button.click(
+                vrarch_separator,
+                [
+                    vrarch_audio,
+                    vrarch_model,
+                    vrarch_output_format,
+                    vrarch_window_size,
+                    vrarch_agression,
+                    vrarch_tta,
+                    vrarch_post_process,
+                    vrarch_post_process_threshold,
+                    vrarch_high_end_process,
+                    vrarch_batch_size,
+                    vrarch_normalization_threshold,
+                    vrarch_amplification_threshold,
+                    vrarch_single_stem,
+                ],
+                [vrarch_status, vrarch_stem1, vrarch_stem2],
+            )
 
         with gr.TabItem("Demucs"):
             with gr.Row():
@@ -1866,6 +2639,13 @@ with gr.Blocks(theme = loadThemes.load_json() or "NoCrypt/miku", title = "🎵 U
             with gr.Row():
                 demucs_button = gr.Button(i18n("Separate!"), variant = "primary")
             with gr.Row():
+                demucs_status = gr.Textbox(
+                    label = i18n("Status log"),
+                    interactive = False,
+                    lines = 6,
+                    value = ""
+                )
+            with gr.Row():
                 demucs_stem1 = gr.Audio(
                     show_download_button = True,
                     interactive = False,
@@ -1906,8 +2686,402 @@ with gr.Blocks(theme = loadThemes.load_json() or "NoCrypt/miku", title = "🎵 U
                 )
 
             demucs_model.change(update_stems, inputs=[demucs_model], outputs=stem6)
-                
-            demucs_button.click(demucs_separator, [demucs_audio, demucs_model, demucs_output_format, demucs_shifts, demucs_segment_size, demucs_segments_enabled, demucs_overlap, demucs_batch_size, demucs_normalization_threshold, demucs_amplification_threshold], [demucs_stem1, demucs_stem2, demucs_stem3, demucs_stem4, demucs_stem5, demucs_stem6])
+
+            demucs_button.click(
+                demucs_separator,
+                [
+                    demucs_audio,
+                    demucs_model,
+                    demucs_output_format,
+                    demucs_shifts,
+                    demucs_segment_size,
+                    demucs_segments_enabled,
+                    demucs_overlap,
+                    demucs_batch_size,
+                    demucs_normalization_threshold,
+                    demucs_amplification_threshold,
+                ],
+                [demucs_status, demucs_stem1, demucs_stem2, demucs_stem3, demucs_stem4, demucs_stem5, demucs_stem6],
+            )
+
+        with gr.TabItem(i18n("Ensemble")):
+            gr.Markdown(i18n("Combine multiple models into an averaged result. Select at least two models and adjust per-architecture options below."))
+            with gr.Row():
+                ensemble_models = gr.CheckboxGroup(
+                    label = i18n("Models to ensemble"),
+                    info = i18n("Choose two or more models to average their outputs"),
+                    choices = ensemble_model_choices,
+                    value = initial_settings.get("Ensemble", {}).get("models", []),
+                    interactive = True
+                )
+                ensemble_output_format = gr.Dropdown(
+                    label = i18n("Select the output format"),
+                    choices = output_format,
+                    value = initial_settings.get("Ensemble", {}).get("output_format", None),
+                    interactive = True
+                )
+            with gr.Row():
+                ensemble_single_stem = gr.Textbox(
+                    label = i18n("Output only single stem"),
+                    placeholder = i18n("Write the stem you want, check the stems of each model on Leaderboard. e.g. Instrumental"),
+                    value = initial_settings.get("Ensemble", {}).get("single_stem", ""),
+                    interactive = True
+                )
+            with gr.Row():
+                ensemble_normalization_threshold = gr.Slider(
+                    label = i18n("Normalization threshold"),
+                    info = i18n("The threshold for audio normalization"),
+                    minimum = 0.1,
+                    maximum = 1,
+                    step = 0.1,
+                    value = initial_settings.get("Ensemble", {}).get("normalization_threshold", 0.9),
+                    interactive = True
+                )
+                ensemble_amplification_threshold = gr.Slider(
+                    label = i18n("Amplification threshold"),
+                    info = i18n("The threshold for audio amplification"),
+                    minimum = 0.1,
+                    maximum = 1,
+                    step = 0.1,
+                    value = initial_settings.get("Ensemble", {}).get("amplification_threshold", 0.7),
+                    interactive = True
+                )
+            with gr.Accordion(i18n("Advanced settings"), open = False):
+                gr.Markdown(i18n("Settings apply only to the selected models of each architecture."))
+                with gr.Tabs():
+                    with gr.TabItem(i18n("BS/Mel Roformer")):
+                        with gr.Row():
+                            ensemble_roformer_segment_size = gr.Slider(
+                                label = i18n("Segment size"),
+                                minimum = 32,
+                                maximum = 4000,
+                                step = 32,
+                                value = initial_settings.get("Ensemble", {}).get("roformer_segment_size", 256),
+                                interactive = True,
+                            )
+                            ensemble_roformer_override_segment_size = gr.Checkbox(
+                                label = i18n("Override segment size"),
+                                value = initial_settings.get("Ensemble", {}).get("roformer_override_segment_size", False),
+                                interactive = True,
+                            )
+                        with gr.Row():
+                            ensemble_roformer_overlap = gr.Slider(
+                                label = i18n("Overlap"),
+                                minimum = 2,
+                                maximum = 10,
+                                step = 1,
+                                value = initial_settings.get("Ensemble", {}).get("roformer_overlap", 8),
+                                interactive = True,
+                            )
+                            ensemble_roformer_batch_size = gr.Slider(
+                                label = i18n("Batch size"),
+                                minimum = 1,
+                                maximum = 16,
+                                step = 1,
+                                value = initial_settings.get("Ensemble", {}).get("roformer_batch_size", 1),
+                                interactive = True,
+                            )
+
+                    with gr.TabItem("MDX23C"):
+                        with gr.Row():
+                            ensemble_mdx23c_segment_size = gr.Slider(
+                                label = i18n("Segment size"),
+                                minimum = 32,
+                                maximum = 4000,
+                                step = 32,
+                                value = initial_settings.get("Ensemble", {}).get("mdx23c_segment_size", 256),
+                                interactive = True,
+                            )
+                            ensemble_mdx23c_override_segment_size = gr.Checkbox(
+                                label = i18n("Override segment size"),
+                                value = initial_settings.get("Ensemble", {}).get("mdx23c_override_segment_size", False),
+                                interactive = True,
+                            )
+                        with gr.Row():
+                            ensemble_mdx23c_overlap = gr.Slider(
+                                label = i18n("Overlap"),
+                                minimum = 2,
+                                maximum = 50,
+                                step = 1,
+                                value = initial_settings.get("Ensemble", {}).get("mdx23c_overlap", 8),
+                                interactive = True,
+                            )
+                            ensemble_mdx23c_batch_size = gr.Slider(
+                                label = i18n("Batch size"),
+                                minimum = 1,
+                                maximum = 16,
+                                step = 1,
+                                value = initial_settings.get("Ensemble", {}).get("mdx23c_batch_size", 1),
+                                interactive = True,
+                            )
+
+                    with gr.TabItem("MDX-NET"):
+                        with gr.Row():
+                            ensemble_mdxnet_hop_length = gr.Slider(
+                                label = i18n("Hop length"),
+                                minimum = 32,
+                                maximum = 2048,
+                                step = 32,
+                                value = initial_settings.get("Ensemble", {}).get("mdxnet_hop_length", 1024),
+                                interactive = True,
+                            )
+                            ensemble_mdxnet_segment_size = gr.Slider(
+                                label = i18n("Segment size"),
+                                minimum = 32,
+                                maximum = 4000,
+                                step = 32,
+                                value = initial_settings.get("Ensemble", {}).get("mdxnet_segment_size", 256),
+                                interactive = True,
+                            )
+                        with gr.Row():
+                            ensemble_mdxnet_denoise = gr.Checkbox(
+                                label = i18n("Denoise"),
+                                value = initial_settings.get("Ensemble", {}).get("mdxnet_denoise", True),
+                                interactive = True,
+                            )
+                            ensemble_mdxnet_overlap = gr.Slider(
+                                label = i18n("Overlap"),
+                                minimum = 0.0,
+                                maximum = 0.99,
+                                step = 0.01,
+                                value = initial_settings.get("Ensemble", {}).get("mdxnet_overlap", 0.25),
+                                interactive = True,
+                            )
+                            ensemble_mdxnet_batch_size = gr.Slider(
+                                label = i18n("Batch size"),
+                                minimum = 1,
+                                maximum = 16,
+                                step = 1,
+                                value = initial_settings.get("Ensemble", {}).get("mdxnet_batch_size", 1),
+                                interactive = True,
+                            )
+
+                    with gr.TabItem(i18n("VR Arch")):
+                        with gr.Row():
+                            ensemble_vrarch_window_size = gr.Slider(
+                                label = i18n("Window size"),
+                                minimum = 320,
+                                maximum = 1024,
+                                step = 32,
+                                value = initial_settings.get("Ensemble", {}).get("vrarch_window_size", 512),
+                                interactive = True,
+                            )
+                            ensemble_vrarch_aggression = gr.Slider(
+                                label = i18n("Agression"),
+                                minimum = 1,
+                                maximum = 50,
+                                step = 1,
+                                value = initial_settings.get("Ensemble", {}).get("vrarch_aggression", 5),
+                                interactive = True,
+                            )
+                            ensemble_vrarch_tta = gr.Checkbox(
+                                label = i18n("TTA"),
+                                value = initial_settings.get("Ensemble", {}).get("vrarch_tta", True),
+                                interactive = True,
+                            )
+                        with gr.Row():
+                            ensemble_vrarch_post_process = gr.Checkbox(
+                                label = i18n("Post process"),
+                                value = initial_settings.get("Ensemble", {}).get("vrarch_post_process", False),
+                                interactive = True,
+                            )
+                            ensemble_vrarch_post_process_threshold = gr.Slider(
+                                label = i18n("Post process threshold"),
+                                minimum = 0.1,
+                                maximum = 0.3,
+                                step = 0.1,
+                                value = initial_settings.get("Ensemble", {}).get("vrarch_post_process_threshold", 0.2),
+                                interactive = True,
+                            )
+                            ensemble_vrarch_high_end_process = gr.Checkbox(
+                                label = i18n("High end process"),
+                                value = initial_settings.get("Ensemble", {}).get("vrarch_high_end_process", False),
+                                interactive = True,
+                            )
+                        with gr.Row():
+                            ensemble_vrarch_batch_size = gr.Slider(
+                                label = i18n("Batch size"),
+                                minimum = 1,
+                                maximum = 16,
+                                step = 1,
+                                value = initial_settings.get("Ensemble", {}).get("vrarch_batch_size", 1),
+                                interactive = True,
+                            )
+
+                    with gr.TabItem("Demucs"):
+                        with gr.Row():
+                            ensemble_demucs_shifts = gr.Slider(
+                                label = i18n("Shifts"),
+                                minimum = 1,
+                                maximum = 20,
+                                step = 1,
+                                value = initial_settings.get("Ensemble", {}).get("demucs_shifts", 2),
+                                interactive = True,
+                            )
+                            ensemble_demucs_segment_size = gr.Slider(
+                                label = i18n("Segment size"),
+                                minimum = 1,
+                                maximum = 100,
+                                step = 1,
+                                value = initial_settings.get("Ensemble", {}).get("demucs_segment_size", 40),
+                                interactive = True,
+                            )
+                            ensemble_demucs_segments_enabled = gr.Checkbox(
+                                label = i18n("Segment-wise processing"),
+                                value = initial_settings.get("Ensemble", {}).get("demucs_segments_enabled", True),
+                                interactive = True,
+                            )
+                        with gr.Row():
+                            ensemble_demucs_overlap = gr.Slider(
+                                label = i18n("Overlap"),
+                                minimum = 0.001,
+                                maximum = 0.999,
+                                step = 0.001,
+                                value = initial_settings.get("Ensemble", {}).get("demucs_overlap", 0.25),
+                                interactive = True,
+                            )
+                            ensemble_demucs_batch_size = gr.Slider(
+                                label = i18n("Batch size"),
+                                minimum = 1,
+                                maximum = 16,
+                                step = 1,
+                                value = initial_settings.get("Ensemble", {}).get("demucs_batch_size", 1),
+                                interactive = True,
+                            )
+            with gr.Row():
+                ensemble_audio = gr.Audio(
+                    label = i18n("Input audio"),
+                    type = "filepath",
+                    interactive = True
+                )
+            with gr.Row():
+                ensemble_button = gr.Button(i18n("Run ensemble"), variant = "primary")
+            with gr.Row():
+                ensemble_status = gr.Textbox(
+                    label = i18n("Status log"),
+                    interactive = False,
+                    lines = 6,
+                    value = ""
+                )
+            with gr.Row():
+                ensemble_stem1 = gr.Audio(
+                    show_download_button = True,
+                    interactive = False,
+                    type = "filepath",
+                    label = i18n("Stem 1"),
+                    visible = False
+                )
+                ensemble_stem2 = gr.Audio(
+                    show_download_button = True,
+                    interactive = False,
+                    type = "filepath",
+                    label = i18n("Stem 2"),
+                    visible = False
+                )
+            with gr.Row():
+                ensemble_stem3 = gr.Audio(
+                    show_download_button = True,
+                    interactive = False,
+                    type = "filepath",
+                    label = i18n("Stem 3"),
+                    visible = False
+                )
+                ensemble_stem4 = gr.Audio(
+                    show_download_button = True,
+                    interactive = False,
+                    type = "filepath",
+                    label = i18n("Stem 4"),
+                    visible = False
+                )
+            with gr.Row():
+                ensemble_stem5 = gr.Audio(
+                    show_download_button = True,
+                    interactive = False,
+                    type = "filepath",
+                    label = i18n("Stem 5"),
+                    visible = False
+                )
+                ensemble_stem6 = gr.Audio(
+                    show_download_button = True,
+                    interactive = False,
+                    type = "filepath",
+                    label = i18n("Stem 6"),
+                    visible = False
+                )
+
+            ensemble_outputs = [ensemble_status, ensemble_stem1, ensemble_stem2, ensemble_stem3, ensemble_stem4, ensemble_stem5, ensemble_stem6]
+
+            components["Ensemble"] = {
+                        "models": ensemble_models,
+                        "output_format": ensemble_output_format,
+                        "single_stem": ensemble_single_stem,
+                        "normalization_threshold": ensemble_normalization_threshold,
+                        "amplification_threshold": ensemble_amplification_threshold,
+                        "roformer_segment_size": ensemble_roformer_segment_size,
+                        "roformer_override_segment_size": ensemble_roformer_override_segment_size,
+                        "roformer_overlap": ensemble_roformer_overlap,
+                        "roformer_batch_size": ensemble_roformer_batch_size,
+                        "mdx23c_segment_size": ensemble_mdx23c_segment_size,
+                        "mdx23c_override_segment_size": ensemble_mdx23c_override_segment_size,
+                        "mdx23c_overlap": ensemble_mdx23c_overlap,
+                        "mdx23c_batch_size": ensemble_mdx23c_batch_size,
+                        "mdxnet_hop_length": ensemble_mdxnet_hop_length,
+                        "mdxnet_segment_size": ensemble_mdxnet_segment_size,
+                        "mdxnet_denoise": ensemble_mdxnet_denoise,
+                        "mdxnet_overlap": ensemble_mdxnet_overlap,
+                        "mdxnet_batch_size": ensemble_mdxnet_batch_size,
+                        "vrarch_window_size": ensemble_vrarch_window_size,
+                        "vrarch_aggression": ensemble_vrarch_aggression,
+                        "vrarch_tta": ensemble_vrarch_tta,
+                        "vrarch_post_process": ensemble_vrarch_post_process,
+                        "vrarch_post_process_threshold": ensemble_vrarch_post_process_threshold,
+                        "vrarch_high_end_process": ensemble_vrarch_high_end_process,
+                        "vrarch_batch_size": ensemble_vrarch_batch_size,
+                        "demucs_shifts": ensemble_demucs_shifts,
+                        "demucs_segment_size": ensemble_demucs_segment_size,
+                        "demucs_segments_enabled": ensemble_demucs_segments_enabled,
+                        "demucs_overlap": ensemble_demucs_overlap,
+                        "demucs_batch_size": ensemble_demucs_batch_size
+                    }
+            all_configurable_inputs.extend(components["Ensemble"].values())
+
+            ensemble_button.click(
+                ensemble_separator,
+                [
+                    ensemble_audio,
+                    ensemble_models,
+                    ensemble_output_format,
+                    ensemble_single_stem,
+                    ensemble_normalization_threshold,
+                    ensemble_amplification_threshold,
+                    ensemble_roformer_segment_size,
+                    ensemble_roformer_override_segment_size,
+                    ensemble_roformer_overlap,
+                    ensemble_roformer_batch_size,
+                    ensemble_mdx23c_segment_size,
+                    ensemble_mdx23c_override_segment_size,
+                    ensemble_mdx23c_overlap,
+                    ensemble_mdx23c_batch_size,
+                    ensemble_mdxnet_hop_length,
+                    ensemble_mdxnet_segment_size,
+                    ensemble_mdxnet_denoise,
+                    ensemble_mdxnet_overlap,
+                    ensemble_mdxnet_batch_size,
+                    ensemble_vrarch_window_size,
+                    ensemble_vrarch_aggression,
+                    ensemble_vrarch_tta,
+                    ensemble_vrarch_post_process,
+                    ensemble_vrarch_post_process_threshold,
+                    ensemble_vrarch_high_end_process,
+                    ensemble_vrarch_batch_size,
+                    ensemble_demucs_shifts,
+                    ensemble_demucs_segment_size,
+                    ensemble_demucs_segments_enabled,
+                    ensemble_demucs_overlap,
+                    ensemble_demucs_batch_size,
+                ],
+                ensemble_outputs,
+            )
 
         with gr.TabItem(i18n("Leaderboard")):
             with gr.Group():

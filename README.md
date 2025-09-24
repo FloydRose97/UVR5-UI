@@ -41,9 +41,21 @@ You can also try it on HuggingFace Spaces running with Zero GPU (A100)!
 * VIP Models
 * Separation of an audio/video from all sites supported by [yt_dlp](https://github.com/yt-dlp/yt-dlp). Check the complete list [here](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md).
 * Batch Separation
+* Ensemble outputs from multiple models in a single run
 * Available in multiple languages
 * Colab/Kaggle/Lightning.ai support
 * Windows/Linux support
+
+## Ensemble Workflow
+
+1. Open the **Ensemble** tab in the interface.
+2. Select two or more models to average from the checkbox list.
+3. (Optional) Expand **Advanced settings** to tweak architecture-specific parameters for the chosen models.
+4. Upload or link an input track and press **Run ensemble**.
+5. Download the generated stems directly from the results area once processing completes.
+
+> [!TIP]
+> When the selected models expose different stem sets, UVR5 UI automatically averages each stem using only the models that produced it and highlights the coverage in the status log.
 
 ## Requirements
 
