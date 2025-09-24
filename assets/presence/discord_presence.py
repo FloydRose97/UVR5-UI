@@ -139,29 +139,41 @@ RPCManager = RichPresenceManager()
 
 def track_presence(state_message):
     def decorator(func):
+        if inspect.isgeneratorfunction(func):
+            @functools.wraps(func)
+            def generator_wrapper(*args, **kwargs):
+                should_update = RPCManager.running and RPCManager.discord_available
+                if should_update:
+                    RPCManager.set_state(state_message)
+
+                generator = func(*args, **kwargs)
+
+                try:
+                    for value in generator:
+                        yield value
+                finally:
+                    if hasattr(generator, "close"):
+                        try:
+                            generator.close()
+                        except Exception:
+                            pass
+                    if should_update and RPCManager.running and RPCManager.discord_available:
+                        RPCManager.set_state("Idling")
+
+            return generator_wrapper
+
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             should_update = RPCManager.running and RPCManager.discord_available
             if should_update:
                 RPCManager.set_state(state_message)
 
-            result = func(*args, **kwargs)
-
-            if inspect.isgenerator(result):
-                def generator_wrapper():
-                    try:
-                        for value in result:
-                            yield value
-                    finally:
-                        if RPCManager.running and RPCManager.discord_available:
-                            RPCManager.set_state("Idling")
-
-                return generator_wrapper()
-
             try:
-                return result
+                return func(*args, **kwargs)
             finally:
                 if should_update and RPCManager.running and RPCManager.discord_available:
                     RPCManager.set_state("Idling")
+
         return wrapper
+
     return decorator
