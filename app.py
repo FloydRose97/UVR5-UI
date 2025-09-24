@@ -321,6 +321,15 @@ class StatusReporter:
             self.progress_callback(progress_value, desc=message)
 
         return "\n".join(self.messages)
+
+
+def extract_error_message(error):
+    """Return a user-facing error string without the quotes added by ``gr.Error``."""
+
+    if isinstance(error, gr.Error) and error.args:
+        return str(error.args[0])
+
+    return str(error)
 out_dir = "./outputs"
 models_dir = "./models"
 extensions = (".wav", ".flac", ".mp3", ".ogg", ".opus", ".m4a", ".aiff", ".ac3")
@@ -750,11 +759,31 @@ def write_ensemble_outputs(combined_outputs, output_format, normalization_thresh
     return ensemble_results
 
 
-def run_model_for_ensemble(audio_path, model_info, single_stem, normalization_threshold, amplification_threshold,
-                           roformer_params, mdx23c_params, mdxnet_params, vrarch_params, demucs_params):
+def run_model_for_ensemble(
+    audio_path,
+    model_info,
+    single_stem,
+    normalization_threshold,
+    amplification_threshold,
+    roformer_params,
+    mdx23c_params,
+    mdxnet_params,
+    vrarch_params,
+    demucs_params,
+    reporter,
+    progress_start=None,
+    progress_end=None,
+):
     os.makedirs(out_dir, exist_ok=True)
     temp_dir = tempfile.mkdtemp(prefix="ensemble_tmp_", dir=out_dir)
     success = False
+
+    def scaled_progress(fraction):
+        if progress_start is None or progress_end is None:
+            return None
+        return progress_start + (progress_end - progress_start) * fraction
+
+    model_display = model_info["display"]
 
     try:
         separator_kwargs = {
@@ -812,43 +841,62 @@ def run_model_for_ensemble(audio_path, model_info, single_stem, normalization_th
         model_path = os.path.join(models_dir, model_filename)
 
         if not os.path.exists(model_path):
-            gr.Info(i18n("This is the first time the {model} model is being used. The separation will take a little longer because the model needs to be downloaded.").format(model=model_info["display"]))
+            download_message = i18n("Downloading model: {model}...").format(model=model_display)
+            yield reporter.emit(download_message, scaled_progress(0.0))
+            gr.Info(
+                i18n(
+                    "This is the first time the {model} model is being used. The separation will take a little longer because the model needs to be downloaded."
+                ).format(model=model_display)
+            )
 
+        yield reporter.emit(i18n("Loading {model}...").format(model=model_display), scaled_progress(0.1))
         try:
             separator.load_model(model_filename=model_filename)
         except SystemExit as exc:
             message = i18n(
                 "{model} exited while loading. The model file may be corrupt. Delete {path} and try again."
-            ).format(model=model_info["display"], path=model_path)
+            ).format(model=model_display, path=model_path)
+            yield reporter.emit(message, scaled_progress(0.15))
             raise gr.Error(message) from exc
         except Exception as exc:
-            raise gr.Error(
-                i18n("Failed to load {model}: {error}").format(model=model_info["display"], error=str(exc))
-            ) from exc
+            message = i18n("Failed to load {model}: {error}").format(model=model_display, error=str(exc))
+            yield reporter.emit(message, scaled_progress(0.15))
+            raise gr.Error(message) from exc
 
+        yield reporter.emit(
+            i18n("Separating with {model}...").format(model=model_display), scaled_progress(0.6)
+        )
         try:
             separation = separator.separate(audio_path)
         except SystemExit as exc:
             message = i18n(
                 "{model} exited unexpectedly during separation. Check the model file and try again."
-            ).format(model=model_info["display"])
+            ).format(model=model_display)
+            yield reporter.emit(message, scaled_progress(0.6))
             raise gr.Error(message) from exc
 
         absolute_paths = [os.path.join(temp_dir, file_name) for file_name in separation]
 
+        yield reporter.emit(
+            i18n("Collecting stems from {model}...").format(model=model_display), scaled_progress(0.85)
+        )
         stem_map = build_ensemble_stem_map(absolute_paths)
         if not stem_map:
-            raise RuntimeError(i18n("Model {model} did not produce any stems.").format(model=model_info["display"]))
+            message = i18n("Model {model} did not produce any stems.").format(model=model_display)
+            yield reporter.emit(message, scaled_progress(0.9))
+            raise RuntimeError(message)
 
         success = True
+        completion_message = i18n("{model} separation complete.").format(model=model_display)
+        yield reporter.emit(completion_message, scaled_progress(1.0))
         return {"temp_dir": temp_dir, "stems": stem_map}
 
     except gr.Error:
         raise
     except Exception as exc:
-        raise RuntimeError(
-            i18n("Model {model} failed: {error}").format(model=model_info["display"], error=str(exc))
-        ) from exc
+        message = i18n("Model {model} failed: {error}").format(model=model_display, error=str(exc))
+        yield reporter.emit(message, scaled_progress(1.0))
+        raise RuntimeError(message) from exc
     finally:
         if not success:
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -1544,13 +1592,14 @@ def ensemble_separator(
                 raise gr.Error(i18n("Unknown model selected: {model}").format(model=model_option))
 
             model_displays.append(model_info["display"])
+            model_start_progress = index / total_steps
+            model_end_progress = (index + 1) / total_steps
             status_text = reporter.emit(
                 i18n("Separating with {model}...").format(model=model_option),
-                index / total_steps,
+                model_start_progress,
             )
             yield (status_text, *empty_audio_updates())
-
-            result = run_model_for_ensemble(
+            runner = run_model_for_ensemble(
                 audio_path,
                 model_info,
                 single_stem_value,
@@ -1561,7 +1610,23 @@ def ensemble_separator(
                 mdxnet_params,
                 vrarch_params,
                 demucs_params,
+                reporter,
+                model_start_progress,
+                model_end_progress,
             )
+
+            result = None
+            while True:
+                try:
+                    status_text = next(runner)
+                except StopIteration as stop:
+                    result = stop.value
+                    break
+                else:
+                    yield (status_text, *empty_audio_updates())
+
+            if result is None:
+                raise RuntimeError(i18n("{model} finished without producing results.").format(model=model_option))
 
             temp_dirs.append(result["temp_dir"])
             stem_maps.append(result["stems"])
@@ -1596,12 +1661,14 @@ def ensemble_separator(
 
         yield (final_status, *updates)
 
-    except ValueError as e:
-        reporter.emit(f"Ensemble error: {e}")
-        raise gr.Error(i18n("Ensemble error: {message}").format(message=str(e)))
     except gr.Error as e:
-        reporter.emit(f"Ensemble error: {e}")
+        message = extract_error_message(e)
+        reporter.emit(i18n("Ensemble error: {message}").format(message=message))
         raise
+    except ValueError as e:
+        message = str(e)
+        reporter.emit(i18n("Ensemble error: {message}").format(message=message))
+        raise gr.Error(i18n("Ensemble error: {message}").format(message=message))
     except Exception as e:
         reporter.emit(f"Ensemble separation failed: {e}")
         raise RuntimeError(f"Ensemble separation failed: {e}") from e
